@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
@@ -14,6 +13,7 @@ from db.connection import get_pool, get_qdrant
 from qdrant_client.models import PointStruct
 from services.embeddings import generate_embedding, event_to_text
 from services.agent_limits import assert_agent_slot
+from services.checksum import compute_row_checksum_v2
 from services.entitlements import embeddings_enabled
 from services.exceptions import bad_request
 
@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 # events.event_type is VARCHAR(100), while the request model allows 255 chars.
 EVENT_TYPE_MAX_LENGTH = 100
+# events.session_id is VARCHAR(255); the request model puts no cap on it.
+SESSION_ID_MAX_LENGTH = 255
 
 
 def _pgvector_literal(embedding: list[float]) -> str:
@@ -72,6 +74,8 @@ def validate_event_payload(
         raise bad_request(f"event must be at most {EVENT_TYPE_MAX_LENGTH} characters")
     _check_value(data, "data")
     _check_value(session_id, "session_id")
+    if session_id is not None and len(session_id) > SESSION_ID_MAX_LENGTH:
+        raise bad_request(f"session_id must be at most {SESSION_ID_MAX_LENGTH} characters")
     _check_value(metadata, "metadata")
     if parent_id is not None:
         try:
@@ -101,11 +105,11 @@ async def write_event(
 
     pool = get_pool()
 
-    content = json.dumps({"event": event, "data": data}, sort_keys=True)
-    checksum = hashlib.sha256(content.encode()).hexdigest()
-
     embed_on = embeddings_enabled()
     initial_status = "pending" if embed_on else "skipped"
+
+    data_json = json.dumps(data)
+    metadata_json = json.dumps(metadata) if metadata else None
 
     # The agent counter and the event row commit together: if the INSERT
     # fails, event_count must not drift and no phantom agent may be created.
@@ -142,24 +146,57 @@ async def write_event(
                 tenant_id,
             )
 
+            # The v2 checksum covers timestamp and sequence_no, so take both
+            # from Postgres up front, along with the JSONB / UUID values in the
+            # canonical form the verifier will read back, then insert the row
+            # once with its checksum. No second write per event, and no reader
+            # ever sees an event without its checksum. Run on `conn` so a
+            # failed insert rolls back with the agent row; the burnt
+            # sequence_no is harmless, /v1/events/verify tolerates gaps.
+            canonical = await conn.fetchrow(
+                """
+                SELECT nextval(pg_get_serial_sequence('events', 'sequence_no')) AS sequence_no,
+                       now() AS timestamp,
+                       $1::jsonb AS data,
+                       $2::jsonb AS metadata,
+                       $3::uuid AS parent_event_id
+                """,
+                data_json,
+                metadata_json,
+                parent_id,
+            )
+            checksum = compute_row_checksum_v2({
+                "tenant_id": tenant_id,
+                "agent_id": agent,
+                "event_type": event,
+                "data": canonical["data"],
+                "parent_event_id": canonical["parent_event_id"],
+                "session_id": session_id,
+                "timestamp": canonical["timestamp"],
+                "sequence_no": canonical["sequence_no"],
+                "metadata": canonical["metadata"],
+            })
+
             row = await conn.fetchrow(
                 """
                 INSERT INTO events (
-                    tenant_id, agent_id, event_type, data,
-                    parent_event_id, session_id, checksum, metadata, index_status
+                    tenant_id, agent_id, event_type, data, parent_event_id, session_id,
+                    metadata, index_status, sequence_no, timestamp, checksum
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING event_id, timestamp, sequence_no
                 """,
                 tenant_id,
                 agent,
                 event,
-                json.dumps(data),
-                parent_id,
+                data_json,
+                canonical["parent_event_id"],
                 session_id,
-                checksum,
-                json.dumps(metadata) if metadata else None,
+                metadata_json,
                 initial_status,
+                canonical["sequence_no"],
+                canonical["timestamp"],
+                checksum,
             )
 
     event_id = str(row["event_id"])

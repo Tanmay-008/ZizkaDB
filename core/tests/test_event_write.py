@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
+from services.checksum import compute_event_checksum_v2
 from services.event_write import _pgvector_literal, write_event
 
 
@@ -30,6 +31,22 @@ def test_pgvector_literal_formats_as_bracketed_csv():
     assert _pgvector_literal([]) == "[]"
 
 
+def _db_row(row: dict) -> dict:
+    """One mocked row that answers both the canonicalising SELECT and the
+    INSERT ... RETURNING in write_event."""
+    return {
+        "tenant_id": "tenant1",
+        "agent_id": "agent1",
+        "event_type": "message",
+        "data": "{}",
+        "parent_event_id": None,
+        "session_id": None,
+        "metadata": None,
+        "checksum": None,
+        **row,
+    }
+
+
 @pytest.fixture
 def mock_pool(monkeypatch):
     pool = AsyncMock()
@@ -46,7 +63,7 @@ def mock_pool(monkeypatch):
     }
 
     conn = _attach_conn(pool)
-    conn.fetchrow.return_value = row
+    conn.fetchrow.return_value = _db_row(row)
     pool.conn = conn
 
     monkeypatch.setattr(
@@ -202,10 +219,11 @@ async def test_usage_meter_failure_does_not_fail_request(
         "sequence_no": 1,
     }
 
-    _attach_conn(pool).fetchrow.return_value = row
+    _attach_conn(pool).fetchrow.return_value = _db_row(row)
 
-    async def execute(*args, **kwargs):
-        raise RuntimeError("usage table failed")
+    async def execute(sql, *args, **kwargs):
+        if "usage_daily" in sql:
+            raise RuntimeError("usage table failed")
 
     pool.execute.side_effect = execute
 
@@ -285,7 +303,8 @@ async def test_agent_upsert_and_event_insert_share_one_transaction(mock_pool):
     assert "INSERT INTO agents" in upsert_sql
     # the first event of a new agent must count itself (event_count = 1, not 0)
     assert "VALUES ($1, $2, 1)" in upsert_sql
-    assert "INSERT INTO events" in conn.fetchrow.await_args_list[0].args[0]
+    assert "nextval" in conn.fetchrow.await_args_list[0].args[0]
+    assert "INSERT INTO events" in conn.fetchrow.await_args_list[1].args[0]
     # nothing touches the agents table outside the transaction
     for call in mock_pool.execute.await_args_list:
         assert "INSERT INTO agents" not in call.args[0]
@@ -296,7 +315,10 @@ async def test_failed_event_insert_propagates_so_the_transaction_rolls_back(mock
     """The agent upsert and the event INSERT sit in one transaction, so an
     INSERT failure must propagate out of ``conn.transaction()`` (which then
     rolls the counter bump back) instead of being swallowed."""
-    mock_pool.conn.fetchrow.side_effect = RuntimeError("insert failed")
+    mock_pool.conn.fetchrow.side_effect = [
+        mock_pool.conn.fetchrow.return_value,
+        RuntimeError("insert failed"),
+    ]
 
     with pytest.raises(RuntimeError, match="insert failed"):
         await write_event(
@@ -337,6 +359,79 @@ async def test_event_longer_than_the_column_is_rejected_with_400(mock_pool, leng
         agent="agent1",
         event="e" * length,
         data={},
+    )
+    if ok:
+        await call
+        return
+
+    with pytest.raises(HTTPException) as exc:
+        await call
+
+    assert exc.value.status_code == 400
+    mock_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_event_inserts_v2_checksum_of_canonical_values(
+    monkeypatch,
+    mock_pool,
+    mock_qdrant,
+):
+    """The checksum hashes the values Postgres canonicalised (what the verifier
+    reads back) and is written by the INSERT itself: one row write per event."""
+    monkeypatch.setattr("services.event_write.embeddings_enabled", lambda: False)
+    canonical = mock_pool.conn.fetchrow.return_value
+    canonical.update(
+        data='{"text": "hello"}',
+        parent_event_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        metadata='{"trace": "t-1"}',
+    )
+    mock_pool.conn.fetchval.return_value = "tenant1"
+
+    result = await write_event(
+        tenant_id="tenant1",
+        agent="agent1",
+        event="message",
+        data={"text": "hello"},
+        parent_id="AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+        session_id="sess-1",
+        metadata={"trace": "t-1"},
+    )
+
+    expected = compute_event_checksum_v2(
+        tenant_id="tenant1",
+        agent_id="agent1",
+        event_type="message",
+        data={"text": "hello"},
+        parent_event_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        session_id="sess-1",
+        timestamp=canonical["timestamp"],
+        sequence_no=7,
+        metadata={"trace": "t-1"},
+    )
+    assert result["checksum"] == expected
+
+    select_call, insert_call = mock_pool.conn.fetchrow.await_args_list
+    assert "nextval" in select_call.args[0]
+    insert_sql, *insert_args = insert_call.args
+    assert "INSERT INTO events" in insert_sql
+    assert insert_args[8:] == [7, canonical["timestamp"], expected]
+    assert not any(
+        "UPDATE events SET checksum" in c.args[0] for c in mock_pool.execute.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length, ok", [(255, True), (256, False)])
+async def test_session_id_longer_than_the_column_is_rejected_with_400(mock_pool, length, ok):
+    """``events.session_id`` is VARCHAR(255) and the request model has no cap,
+    so a longer value used to fail inside the INSERT with a 500."""
+    call = write_event(
+        tenant_id="tenant1",
+        agent="agent1",
+        event="message",
+        data={},
+        session_id="s" * length,
     )
     if ok:
         await call
