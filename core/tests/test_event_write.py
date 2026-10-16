@@ -325,3 +325,25 @@ async def test_unknown_parent_is_rejected_inside_the_transaction(mock_pool):
 
     assert exc.value.status_code == 400
     mock_pool.conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length, ok", [(100, True), (101, False), (255, False)])
+async def test_event_longer_than_the_column_is_rejected_with_400(mock_pool, length, ok):
+    """``events.event_type`` is VARCHAR(100) but the request model allows 255
+    characters, so a 101-255 character event used to fail mid-write with a 500."""
+    call = write_event(
+        tenant_id="tenant1",
+        agent="agent1",
+        event="e" * length,
+        data={},
+    )
+    if ok:
+        await call
+        return
+
+    with pytest.raises(HTTPException) as exc:
+        await call
+
+    assert exc.value.status_code == 400
+    mock_pool.acquire.assert_not_called()
