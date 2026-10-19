@@ -6,6 +6,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-19
+
+Packages: `zizkadb-sdk` 0.3.0 (PyPI + npm), `zizkadb-mcp` 0.1.8, `zizkadb-livekit` 0.2.1, `zizkadb-crewai` 0.1.3, `zizkadb-langgraph` 0.1.0 (first release). `zizkadb-langchain` is unchanged at 0.1.3. API display version 0.3.0.
+
 ### Impact trace: what did this event cause?
 
 - New `GET /v1/events/{event_id}/impact?depth=` walks the causal graph downstream, the mirror of `/why`: every event that descends from the given one through `parent_event_id`, with its `depth` (anchor first, then by depth). `depth` is 0–50 (default 10). At most 500 nodes are returned (the shallowest first); `truncated: true` says the cap was hit, and `depth_truncated: true` says more events lie below the depth limit.
