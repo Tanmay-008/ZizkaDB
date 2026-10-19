@@ -20,6 +20,8 @@ Drift detection · MCP server · Python & TypeScript SDKs · Self-host or cloud
 [![TypeScript SDK](https://img.shields.io/npm/v/zizkadb-sdk?label=TypeScript%20SDK)](https://www.npmjs.com/package/zizkadb-sdk)
 [![GitHub stars](https://img.shields.io/github/stars/Zizka-ai/ZizkaDB?style=flat)](https://github.com/Zizka-ai/ZizkaDB/stargazers)
 
+<a href="https://postyourstartup.co/startup/zizkadb-1?ref=award" target="_blank"><img src="https://postyourstartup.co/api/badge/zizkadb-1/award?theme=light&week=32" alt="#1 Product of the Week on PostYourStartup" width="212" height="55" /></a>
+
 </div>
 
 Every agent team eventually asks: *Why did it say that? Why did it call that tool?* ZizkaDB links every agent step to the step that caused it, so you get the answer in one call instead of scrolling through traces.
