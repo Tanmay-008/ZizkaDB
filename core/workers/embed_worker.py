@@ -31,8 +31,8 @@ def _next_retry_at(retry_count: int) -> datetime:
 
     Formula: now + BASE_BACKOFF_SEC * (2 ** retry_count)
 
-    retry 1 → +5 s,  retry 2 → +10 s,  retry 3 → +20 s,
-    retry 4 → +40 s, retry 5 → exceeded MAX_RETRIES → dead_letter.
+    retry 1 → +10 s, retry 2 → +20 s, retry 3 → +40 s,
+    retry 4 → +80 s, retry 5 → exceeded MAX_RETRIES → dead_letter.
     """
     delay = BASE_BACKOFF_SEC * (2 ** retry_count)
     return datetime.now(timezone.utc) + timedelta(seconds=delay)
