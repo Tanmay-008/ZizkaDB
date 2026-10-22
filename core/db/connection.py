@@ -226,12 +226,11 @@ async def init_db():
         ALTER TABLE events
         ADD COLUMN IF NOT EXISTS last_error   TEXT;
 
-        CREATE INDEX IF NOT EXISTS idx_events_index_pending_retry
-        ON events (index_status, next_retry_at NULLS FIRST, timestamp ASC)
+        CREATE INDEX IF NOT EXISTS idx_events_pending_failed
+        ON events (timestamp) 
         WHERE index_status IN ('pending', 'failed');
     """)
-
-    # Event checksum v2 (services/checksum.py). The first start on v2 code
+     # Event checksum v2 (services/checksum.py). The first start on v2 code
     # records the newest event that may still carry a v1 checksum; v1 is never
     # accepted above it, so a v2 row cannot be downgraded. Later starts keep
     # the original value (ON CONFLICT DO NOTHING).
